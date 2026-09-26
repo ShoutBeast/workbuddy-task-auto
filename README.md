@@ -1,6 +1,6 @@
 # 🖱️  WorkBuddy 成长任务一键完成
 
-`workbuddy_task.py` —— 读取本机 WorkBuddy 桌面端登录会话，把官方「成长计划」中**可纯 API 完成**的
+`workbuddy-task-auto` —— 读取本机 WorkBuddy 桌面端登录会话，把官方「成长计划」中**可纯 API 完成**的
 成长任务做成**编号菜单**，按输入数字完成指定任务，执行后**回读进度并自动领奖**。
 
 - 🖱️ **菜单交互**：无参数运行即展示任务菜单
@@ -35,24 +35,25 @@
 ### 运行
 
 ```bash
-python workbuddy_task.py            # 交互式菜单
+python workbuddy_task.py            # 交互式菜单（循环输入，可连续执行）
 python workbuddy_task.py list       # 仅列出任务编号，不执行
-python workbuddy_task.py 0          # 一键完成全部任务（全选）
+python workbuddy_task.py all        # 一键完成全部任务（全选）
 python workbuddy_task.py 3          # 只完成第 3 项任务（单选）
 python workbuddy_task.py 1 3 5      # 完成第 1、3、5 项（多选）
 python workbuddy_task.py 1-5        # 完成第 1~5 项（区间）
+python workbuddy_task.py chat_5     # 直接按任务代码（task_code）执行
 ```
 
 交互式菜单支持同样的输入：
 
 | 输入 | 含义 |
 |---|---|
-| `0` | 一键完成全部任务（全选） |
 | `1` | 执行第 1 项任务 |
-| `1,3,5` | 执行第 1、3、5 项（多选，逗号分隔） |
-| `1-5` | 执行第 1~5 项（区间） |
+| `1 3 5` 或 `1,3,5` | 执行第 1、3、5 项（多选，空格或逗号分隔） |
+| `1-10` | 执行第 1~10 项（区间） |
+| `all` | 执行全部任务（全选） |
 | `list` | 仅列出任务，不执行 |
-| `q` / `quit` | 退出 |
+| `q` / 回车 | 退出 |
 
 ---
 
@@ -87,25 +88,32 @@ python workbuddy_task.py 1-5        # 完成第 1~5 项（区间）
 | 14 | `Hp_Appearance` | 设置主题 API + 皮肤生效事件 | +100c +5e |
 | 15 | `skill_1` | 真实对话 + `skill_info` 技能加载事件 | +100c +5e |
 | 16 | `Expert_lighthouse` | 腾讯轻量云专家召唤 + 使用链 | +100c +5e |
-| 17 | `school_season` | 校园日（小程序口径）：mini 对话 + activityId | +100c +5e |
-| 18 | `Sequential_Tasks_1` | 小程序首对话 | +100c +5e |
-| 19 | `Sequential_Tasks_2` | 小程序选中专家对话 | +200c +5e |
-| 20 | `Sequential_Tasks_3` | 小程序五次对话 | +300c +5e |
-| 21 | `Sequential_Tasks_4` | 小程序定时任务（预留，每日零点解锁一环） | — |
-| 22 | `Sequential_Tasks_5` | 小程序使用 GLM5.2（预留） | — |
-| 23 | `Sequential_Tasks_6` | 小程序十次对话（预留） | — |
-| 24 | `Sequential_Tasks_7` | 体验灵感功能（预留，疑 PC 口径） | — |
+| 17 | `black_cat` | 夜猫子（**尝试型**）：23:00–08:00 窗口内 glm-5.2 对话补足 | — |
+| 18 | `school_season` | 校园日（小程序口径）：mini 对话 + activityId | +100c +5e |
+| 19 | `Sequential_Tasks_1` | 小程序首对话 | +100c +5e |
+| 20 | `Sequential_Tasks_2` | 小程序选中专家对话 | +200c +5e |
+| 21 | `Sequential_Tasks_3` | 小程序五次对话 | +300c +5e |
+| 22 | `Sequential_Tasks_4` | 小程序定时任务（每日零点解锁一环，PC 同源事件） | — |
+| 23 | `Sequential_Tasks_5` | 小程序使用 GLM5.2（mp 模型字段对话事件） | — |
+| 24 | `Sequential_Tasks_6` | 小程序十次对话（自动补差额） | — |
+| 25 | `Sequential_Tasks_7` | 体验灵感功能（PC + mp 双形态事件组） | — |
 
-> **全新账号一键全做完 ≈ +1950 积分 +78 能量**。仅少数任务涉及真实对话（`Model_chat_GLM5.2`、
-> `expert_5` / `Expert_team_use_3` / `skill_1` 各数条 `fast-model` 短对话），其余全部为行为事件上报，
+> 编号与脚本内 `TASK_TABLE` 一一对应（共 **25** 项）。**全新账号除 `black_cat` 外一键全做完
+> ≈ +1950 积分 +78 能量**。仅少数任务涉及真实对话（`Model_chat_GLM5.2`、`expert_5` /
+> `Expert_team_use_3` / `skill_1` 各数条 `fast-model` 短对话），其余全部为行为事件上报，
 > **零对话消耗**。
+
+### 需注意的任务
+
+| 任务 | 说明 |
+|---|---|
+| `black_cat`（夜猫子，#17） | 需在 **23:00–08:00** 本地时间窗口内执行才计分；窗口外执行会提示稍后重试 |
 
 ### 不可自动完成的任务
 
 | 任务 | 原因 |
 |---|---|
 | `Expert_Philanthropy` | 需真实捐款，服务端领奖时校验捐赠回执，无法绕过 |
-| `black_cat`（夜猫子） | 需在 **23:00–08:00** 计数窗口内完成 glm-5.2 对话，未纳入菜单 |
 
 ---
 
