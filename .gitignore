@@ -1,0 +1,67 @@
+# 本地工作区 / 数据目录
+/.codebuddy/
+/.codebuddy-backup/
+/backups/
+/data/
+/auths/
+/task/
+/tools/
+
+# ============================================================
+#  Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# 字节码 / 编译产物
+*.egg-info/
+.eggs/
+build/
+dist/
+*.manifest
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# 缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# ============================================================
+#  本地配置 / 凭据 / 日志（切勿提交）
+# ============================================================
+*.log
+signin.log
+config.json
+.env
+.env.*
+*.key
+*.pem
+workbuddy-desktop.info
+*workbuddy-*.json
+
+# ============================================================
+#  编辑器 / 系统
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
