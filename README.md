@@ -6,7 +6,10 @@
 - 🖱️ **菜单交互**：无参数运行即展示任务菜单
 - 🔢 **按编号执行**：支持单选、多选、区间、全选
 - 🔁 **回读 + 自动领奖**：执行动作后轮询回读进度（上游计分异步），达标即自动领取奖励
-- 🔒 **零第三方依赖**：仅用 Python 标准库；token 仅在内存中使用，不写日志、不外传
+- 🌐 **浏览器弹窗登录（v5.9.0+ 推荐）**：`login` 命令拉起 Chrome/Edge 登录，自动换取 Bearer Token / Web Cookie，无需手动翻 DevTools
+- 🔐 **本地加密缓存**：Windows 下用 DPAPI 加密登录缓存，仅当前系统用户可解密
+- ⏰ **过期提醒**：`status` 查看凭据剩余时间，临期/过期时自动提示重新登录
+- 🔒 **零第三方依赖**：核心与浏览器登录均仅用 Python 标准库；token 不写日志、不外传
 - ♻️ **幂等安全**：已完成 / 已领取的任务自动跳过，重复运行不重复扣资源
 
 
@@ -30,11 +33,15 @@
 ### 环境要求
 
 - Python **3.10+**
-- 本机已登录 **WorkBuddy / CodeBuddy 桌面端**（脚本从桌面端登录会话读取凭据）
+- 本机安装 Chrome / Edge（浏览器登录），或已登录 **WorkBuddy / CodeBuddy 桌面端**
+- WorkBuddy **v5.9.0+** 推荐直接运行 `python workbuddy_task.py login`
 
 ### 运行
 
 ```bash
+python workbuddy_task.py login      # 弹窗浏览器登录，自动抓取凭据并缓存
+python workbuddy_task.py status     # 查看登录缓存与过期时间
+python workbuddy_task.py logout     # 删除登录缓存
 python workbuddy_task.py            # 交互式菜单（循环输入，可连续执行）
 python workbuddy_task.py list       # 仅列出任务编号，不执行
 python workbuddy_task.py all        # 一键完成全部任务（全选）
@@ -42,6 +49,15 @@ python workbuddy_task.py 3          # 只完成第 3 项任务（单选）
 python workbuddy_task.py 1 3 5      # 完成第 1、3、5 项（多选）
 python workbuddy_task.py 1-5        # 完成第 1~5 项（区间）
 python workbuddy_task.py chat_5     # 直接按任务代码（task_code）执行
+```
+
+`login` 会打开一个独立的浏览器窗口，扫码或账号登录后自动关闭：
+
+```bash
+python workbuddy_task.py login                    # 默认 Chrome/Edge
+python workbuddy_task.py login --browser edge     # 指定 Edge
+python workbuddy_task.py login --timeout 300      # 登录等待上限（秒）
+python workbuddy_task.py login --manual           # 浏览器抓取失败时手动粘贴 Token
 ```
 
 交互式菜单支持同样的输入：
@@ -54,6 +70,19 @@ python workbuddy_task.py chat_5     # 直接按任务代码（task_code）执行
 | `all` | 执行全部任务（全选） |
 | `list` | 仅列出任务，不执行 |
 | `q` / 回车 | 退出 |
+
+---
+
+## 变更原因（WorkBuddy 新版本本地凭据加密）
+
+WorkBuddy 桌面端较新版本（**v5.9.0+ 已确认**）会把 `workbuddy-desktop.info` 中的敏感字段（`accessToken`、`refreshToken`、`nickname`、`phoneNumber` 等）写成 `$wbEncrypted` 信封。直接读取凭据文件只能拿到密文，旧版“读本地明文 Token”的方式不再可靠。
+
+因此脚本改为两条获取路径：
+
+1. **浏览器登录（推荐）**：打开本机 Chrome / Edge，由用户自己完成扫码或账号登录；脚本在页面内走 WorkBuddy 官方的 `plugin auth state` 流程，换取与桌面端等价的 Bearer Token，再用 Windows DPAPI 加密缓存。整个过程不读取、不硬编码任何密钥。
+2. **桌面端凭据兜底**：如果本机已有可用的桌面登录态，脚本会读取凭据文件；遇到 `$wbEncrypted` 时，可选地从运行中的 WorkBuddy 进程内存提取 `atRestSecretKey` 完成解密（实验特性，可用 `WORKBUDDY_DISABLE_MEMORY_SCAN=1` 关闭）。
+
+仓库代码中**不包含任何 Token、Cookie、`atRestSecretKey` 或账号信息**；登录缓存只落在本机用户目录，默认加密，不进入 Git。
 
 ---
 
@@ -119,7 +148,59 @@ python workbuddy_task.py chat_5     # 直接按任务代码（task_code）执行
 
 ## 登录会话
 
-脚本按平台自动探测 WorkBuddy 桌面端写出的凭据文件，无需输入账号密码：
+脚本按以下优先级获取登录凭据：
+
+1. `WORKBUDDY_TOKEN` 环境变量（适合 CI / 临时使用）；
+2. `login` 命令写入的浏览器登录缓存；
+3. WorkBuddy 桌面端写出的凭据文件（`$wbEncrypted` 时尝试本地解密）。
+
+### 浏览器弹窗登录（推荐）
+
+```bash
+python workbuddy_task.py login
+```
+
+- 脚本会启动一个**独立的 Chrome/Edge 窗口**，打开成长中心；
+- 用户在窗口里扫码 / 账号登录，脚本通过 Chrome DevTools Protocol 等待登录完成；
+- 登录后自动抓取：
+  - 优先在页面上下文里走 `plugin auth state` 流程换取桌面端 Bearer Token：`POST /v2/plugin/auth/state?platform=workbuddy` → `GET /console/auth/login?...` → 轮询 `/v2/plugin/auth/token?state=...`。该 Token 与桌面端等价，可用于全部任务；
+  - 页面 URL / `localStorage` / `sessionStorage` 中的 Bearer Token（如果页面提供）；
+  - `www.workbuddy.cn` 的 HttpOnly Cookie（通过 CDP `Network.getAllCookies`，不依赖 `document.cookie`）；
+- 抓到的凭据写入本地缓存，浏览器窗口自动关闭。
+
+> CI / 无桌面环境无法弹窗，请使用 `WORKBUDDY_TOKEN`（配合 `WORKBUDDY_UID`）或 `--manual` 预先导入 Token。
+
+登录缓存路径：
+
+| 平台 | 路径 |
+|---|---|
+| Windows | `%LOCALAPPDATA%\workbuddy-task-auto\session.dat` |
+| macOS / Linux | `~/.local/share/workbuddy-task-auto/session.dat` |
+
+Windows 下缓存用 **DPAPI** 加密，只有当前 Windows 用户能解密；其他平台以 `0600` 权限落盘。可用 `WORKBUDDY_CACHE_DIR` 覆盖缓存目录。
+
+```bash
+python workbuddy_task.py status     # 查看来源、UID、Token/Cookie 到期时间
+python workbuddy_task.py logout     # 删除缓存
+```
+
+### 能力边界
+
+- **Token 模式**：可以执行全部任务（对话、事件上报、领奖）；
+- **Web Cookie 模式**：浏览器只拿到 `www.workbuddy.cn` 的 HttpOnly Cookie，可以**查看任务 / 报名 / 领奖**，但不能调用 `copilot.tencent.com` 的对话和桌面事件上报接口。此时执行对话类任务会提示 `AUTH_REQUIRED`，需要桌面端 Token 或 `WORKBUDDY_TOKEN`；
+- 如果缓存里只有 Cookie，脚本仍会优先尝试桌面端 Token；只有找不到桌面 Token 时才进入 Cookie 模式，避免浏览器登录覆盖原本可用的桌面会话；
+- `login` 会优先用浏览器里的登录态换取桌面端 Bearer Token；如果 `plugin auth state` 流程失败（例如服务端接口变更），才回退到保存 Cookie 并明确提示当前是 Cookie 模式。需要完整任务能力时请使用桌面端凭据或 `--manual` 粘贴 Token。
+
+### 适用场景
+
+- ✅ **个人本机使用**：自己的 Windows 账号、自己的 WorkBuddy 账号，凭据只缓存在本机；
+- ✅ **WorkBuddy v5.9.0+**：本地凭据已加密，使用 `login` 通过浏览器登录获取 Token；
+- ✅ **需要完整任务能力**：浏览器登录换取的 Bearer Token 可调用对话、事件上报和领奖接口；
+- ✅ **CI / 无桌面环境**：设置 `WORKBUDDY_TOKEN` + `WORKBUDDY_UID`，不启动浏览器；
+- ⚠️ **仅 Cookie 模式**：只能查看任务、报名、领奖，不能执行对话和桌面事件上报；
+- ❌ **不适用**：共享账号、多人共用、公共电脑，或把 `session.dat` / Token / Cookie 提交到仓库或发给他人。
+
+### 桌面端凭据文件
 
 | 平台 | 路径 |
 |---|---|
@@ -143,6 +224,11 @@ export WORKBUDDY_AUTH_FILE="/path/to/workbuddy-desktop.info"
 | 环境变量 | 作用 |
 |---|---|
 | `WORKBUDDY_AUTH_FILE` | 覆盖桌面端凭据文件路径 |
+| `WORKBUDDY_TOKEN` | 直接传入明文 Bearer Token（优先级最高） |
+| `WORKBUDDY_UID` | 配合 `WORKBUDDY_TOKEN` 指定 UID |
+| `WORKBUDDY_CACHE_DIR` | 覆盖浏览器登录缓存目录 |
+| `WORKBUDDY_ATREST_KEY` | 可选：直接提供 `atRestSecretKey`，跳过内存扫描 |
+| `WORKBUDDY_DISABLE_MEMORY_SCAN` | 设为 `1` 时禁用桌面凭据内存扫描（推荐在公开环境使用） |
 
 ---
 
@@ -163,7 +249,9 @@ export WORKBUDDY_AUTH_FILE="/path/to/workbuddy-desktop.info"
 
 ## ⚠️ 安全与合规
 
-- **凭据**：脚本读取桌面端凭据文件中的 `accessToken`，**仅在内存中使用**，不写入日志、不外传；
+- **凭据**：脚本不会把 Token / Cookie 写进日志或发往非官方域名；浏览器登录缓存使用 Windows DPAPI 加密（其他平台 `0600` 权限），仅当前系统用户可读；
+- **浏览器登录**：只连接本机临时启动的 Chrome/Edge 调试端口，登录完成后立即关闭并删除临时浏览器 profile；
+- **内存解密（实验）**：桌面端凭据为 `$wbEncrypted` 时，脚本可能从运行中的 WorkBuddy 进程读取 `atRestSecretKey` 完成解密。该行为依赖客户端内部实现，版本升级可能失效，也可能被安全软件拦截；如不需要，可设置 `WORKBUDDY_DISABLE_MEMORY_SCAN=1`，或先运行 `login` 使用浏览器登录缓存（缓存优先于桌面凭据）。公开分发前建议评估是否保留；
 - **网络**：所有请求仅发往官方域名（`copilot.tencent.com` / `www.codebuddy.cn` / `www.workbuddy.cn`）；
 - **边界**：仅限**本人授权账号**、本机 / 私有环境使用，不得共享、转售或违规分发；
 - **风险**：自动化请求可能触发上游风控，请遵守平台服务条款并自行承担使用风险。

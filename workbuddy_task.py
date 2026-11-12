@@ -5,6 +5,10 @@ CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info），把面板
 「成长任务一键完成（17/18）」的核心逻辑移植为可按数字选择执行的命令行脚本：
 每个任务对应一个编号，输入编号即执行对应任务的「动作 → 回读 → 自动领奖」闭环。
 
+WorkBuddy 较新版本（v5.9.0+ 已确认）会把本地凭据写成 $wbEncrypted 信封；
+推荐先运行 login 通过浏览器登录换取 Bearer Token 并加密缓存，脚本同时保留
+桌面端凭据与内存解密作为兜底。代码中不硬编码任何 Token、Cookie 或密钥。
+
 端点（Go 代码实测口径）：
   - chat 域  https://copilot.tencent.com   growth/tasks/buddy/streak/chat/桌面指纹report
   - billing 域 https://www.codebuddy.cn     /v2/report（对话活跃上报 / 小程序指纹上报）
@@ -23,14 +27,24 @@ CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info），把面板
   python workbuddy_task.py all        # 全部可自动化任务（先批量 accept）
   python workbuddy_task.py list       # 只列出任务清单
   python workbuddy_task.py chat_5     # 直接按任务 code 执行
+  python workbuddy_task.py login      # 弹窗浏览器登录，自动抓取 Token/Cookie 并缓存
+  python workbuddy_task.py status     # 查看登录缓存和过期时间
+  python workbuddy_task.py logout     # 删除登录缓存
 """
 
+import base64
+import getpass
 import hashlib
 import json
 import os
 import re
+import shutil
+import socket
 import ssl
+import struct
+import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import urllib.error
@@ -50,8 +64,15 @@ WEB_BASE = "https://www.workbuddy.cn"        # Web 成长中心领奖 / web 指�
 
 PATH_LIST_TASKS = "/v2/activity/growth/tasks"
 PATH_ACCEPT_TASKS = "/v2/activity/growth/tasks/accept"
+PATH_ACCEPT_TASKS_WEB = "/activity/growth/tasks/accept"
 PATH_REPORT = "/v2/report"
 PATH_CHAT = "/v2/chat/completions"
+
+GROWTH_CENTER_URL = WEB_BASE + "/profile/growth-center"
+AUTH_CACHE_DIR = os.environ.get("WORKBUDDY_CACHE_DIR") or os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.local/share"),
+    "workbuddy-task-auto")
+AUTH_CACHE_FILE = os.path.join(AUTH_CACHE_DIR, "session.dat")
 
 DESKTOP_UA = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
 CLIENT_UA = "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1"
@@ -91,7 +112,11 @@ def log(msg):
     try:
         print(line, flush=True)
     except UnicodeEncodeError:
-        print(line.encode("utf-8", "replace").decode("utf-8", "replace"), flush=True)
+        # 旧版 Windows 控制台是 GBK；用 GBK 替换不可编码字符，避免二次抛错。
+        try:
+            print(line.encode("gbk", "replace").decode("gbk"), flush=True)
+        except Exception:
+            print(line.encode("ascii", "replace").decode("ascii"), flush=True)
 
 
 def now_ms():
@@ -170,6 +195,1123 @@ def load_session(auth_file):
         return json.load(f)
 
 
+def extract_at_rest_key_from_windows_processes(key_id_target=None):
+    """Windows 下从运行中的 WorkBuddy.exe 进程内存中搜索 atRestSecretKey。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import subprocess
+
+        kernel32 = ctypes.windll.kernel32
+
+        class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BaseAddress", ctypes.c_void_p),
+                ("AllocationBase", ctypes.c_void_p),
+                ("AllocationProtect", wintypes.DWORD),
+                ("PartitionId", wintypes.WORD),
+                ("RegionSize", ctypes.c_size_t),
+                ("State", wintypes.DWORD),
+                ("Protect", wintypes.DWORD),
+                ("Type", wintypes.DWORD),
+            ]
+
+        PROCESS_VM_READ = 0x0010
+        PROCESS_QUERY_INFORMATION = 0x0400
+        MEM_COMMIT = 0x1000
+        PAGE_READWRITE = 0x04
+        PAGE_READONLY = 0x02
+
+        output = subprocess.check_output(
+            'tasklist /FI "IMAGENAME eq WorkBuddy.exe" /FO CSV',
+            shell=True
+        ).decode("gbk", "ignore")
+        lines = [l.strip() for l in output.splitlines() if l.strip()]
+        pids = []
+        for line in lines[1:]:
+            parts = [p.strip('"') for p in line.split('","')]
+            if len(parts) >= 2:
+                try:
+                    pids.append(int(parts[1]))
+                except ValueError:
+                    pass
+
+        if not pids:
+            return None
+
+        pattern = re.compile(rb'"atRestSecretKey"\s*:\s*"([A-Za-z0-9+/]{43}=)"')
+
+        for pid in pids:
+            hProcess = kernel32.OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, False, pid)
+            if not hProcess:
+                continue
+            try:
+                address = 0
+                mbi = MEMORY_BASIC_INFORMATION()
+                while kernel32.VirtualQueryEx(hProcess, ctypes.c_void_p(address), ctypes.byref(mbi), ctypes.sizeof(mbi)):
+                    if mbi.State == MEM_COMMIT and (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY)):
+                        size = mbi.RegionSize
+                        if size <= 64 * 1024 * 1024:
+                            buf = ctypes.create_string_buffer(size)
+                            bytesRead = ctypes.c_size_t()
+                            if kernel32.ReadProcessMemory(hProcess, ctypes.c_void_p(address), buf, size, ctypes.byref(bytesRead)):
+                                data = bytes(buf.raw[:bytesRead.value])
+                                for m in pattern.finditer(data):
+                                    sec = m.group(1).decode("ascii")
+                                    n = hashlib.sha256(sec.encode("utf-8")).digest()
+                                    kid = hashlib.sha256(n).hexdigest()[:16]
+                                    if not key_id_target or kid == key_id_target:
+                                        return sec
+                    address += mbi.RegionSize
+                    if address >= 0x7FFFFFFF0000:
+                        break
+            finally:
+                kernel32.CloseHandle(hProcess)
+    except Exception:
+        pass
+    return None
+
+
+def try_decrypt_at_rest_token(enc_obj):
+    """当本地凭据被 $wbEncrypted 加密时，尝试从内存或环境变量提取密钥并解密明文 Token。"""
+    if not isinstance(enc_obj, dict) or not enc_obj.get("envelope"):
+        return None
+    try:
+        env_raw = base64.b64decode(enc_obj["envelope"])
+        env_json = json.loads(env_raw)
+        key_id = env_json.get("keyId")
+    except Exception:
+        return None
+
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError:
+        log("提示: 解密 WorkBuddy 凭据需要 cryptography 库 (pip install cryptography)")
+        log("     也可以运行 python workbuddy_task.py login 走浏览器登录缓存。")
+        return None
+
+    secret = os.environ.get("WORKBUDDY_ATREST_KEY")
+    if not secret and os.environ.get("WORKBUDDY_DISABLE_MEMORY_SCAN") != "1":
+        secret = extract_at_rest_key_from_windows_processes(key_id)
+
+    if not secret:
+        return None
+
+    try:
+        nonce = base64.b64decode(env_json["nonce"])
+        auth_tag = base64.b64decode(env_json["authTag"])
+        ciphertext = base64.b64decode(env_json["ciphertext"])
+
+        aad = b"".join([
+            b"WB-AAD\0",
+            b"\x01",
+            (5).to_bytes(4, "big") + b"WBEV1",
+            (6).to_bytes(4, "big") + b"sym-v1",
+            (1).to_bytes(4, "big"),
+            (16).to_bytes(4, "big") + key_id.encode("ascii"),
+            b"\x02\x00\x00"
+        ])
+
+        aes_key = hashlib.sha256(secret.encode("utf-8")).digest()
+        aesgcm = AESGCM(aes_key)
+        plaintext = aesgcm.decrypt(nonce, ciphertext + auth_tag, aad)
+        return plaintext.decode("utf-8")
+    except Exception as e:
+        log("自动解密凭据失败: %s" % e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 登录缓存（浏览器弹窗登录 / DPAPI 加密）
+# ---------------------------------------------------------------------------
+
+def decode_jwt_payload(token):
+    """不校验签名，仅解出 JWT payload 用于读取 exp/sub。"""
+    if not isinstance(token, str):
+        return {}
+    parts = token.split(".")
+    if len(parts) != 3:
+        return {}
+    try:
+        pad = "=" * (-len(parts[1]) % 4)
+        raw = base64.urlsafe_b64decode(parts[1] + pad)
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def jwt_expiry_ms(token):
+    exp = decode_jwt_payload(token).get("exp")
+    try:
+        return int(float(exp) * 1000)
+    except (TypeError, ValueError):
+        return 0
+
+
+def jwt_uid(token):
+    payload = decode_jwt_payload(token)
+    return payload.get("sub") or payload.get("user_id") or payload.get("uid") or ""
+
+
+def format_ts(ms):
+    if not ms:
+        return "未知"
+    try:
+        return datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
+    except (OverflowError, OSError, ValueError):
+        return "未知"
+
+
+def remaining_text(ms):
+    if not ms:
+        return "未知"
+    diff = ms - now_ms()
+    if diff <= 0:
+        return "已过期"
+    if diff >= 86400000:
+        return "%.1f 天" % (diff / 86400000)
+    return "%.0f 小时" % (diff / 3600000)
+
+
+def _cookie_header(cookies):
+    return "; ".join("%s=%s" % (c.get("name"), c.get("value"))
+                     for c in cookies if c.get("name"))
+
+
+def _cookie_expiry_ms(cookies):
+    preferred = [c for c in cookies
+                 if c.get("name") in ("session", "session_2", "KEYCLOAK_SESSION")]
+    values = []
+    for c in (preferred or cookies):
+        exp = c.get("expires")
+        if isinstance(exp, (int, float)) and exp > 0:
+            values.append(int(exp * 1000))
+    return min(values) if values else 0
+
+
+def _filter_auth_cookies(cookies):
+    return [c for c in cookies
+            if "workbuddy.cn" in (c.get("domain") or "")
+            or "codebuddy.cn" in (c.get("domain") or "")]
+
+
+def _http_json(method, url, headers, payload=None, timeout=20):
+    """轻量 HTTP JSON 请求，返回 (status, obj, headers)。"""
+    body = None
+    if payload is not None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            try:
+                obj = json.loads(raw) if raw else {}
+            except Exception:
+                obj = {"raw": raw[:500]}
+            return resp.status, obj, dict(resp.headers)
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            obj = json.loads(raw) if raw else {}
+        except Exception:
+            obj = {"raw": raw[:500]}
+        return e.code, obj, dict(e.headers)
+    except Exception as e:
+        return -1, {"error": str(e)}, {}
+
+
+def _token_headers(token):
+    headers = {
+        "Authorization": "Bearer " + token,
+        "Accept": "application/json",
+        "X-CodeBuddy-Request": "1",
+        "User-Agent": BILLING_UA,
+    }
+    uid = jwt_uid(token)
+    if uid:
+        headers["X-User-Id"] = uid
+    return headers
+
+
+def _cookie_headers(cookies):
+    return {
+        "Cookie": _cookie_header(cookies),
+        "Accept": "application/json",
+        "x-client-platform": "web",
+        "Referer": GROWTH_CENTER_URL,
+        "User-Agent": CLIENT_UA,
+    }
+
+
+def validate_token(token):
+    """验证 Bearer Token 是否能正常读取成长任务，返回 (ok, uid, detail)。"""
+    uid = jwt_uid(token)
+    last_status = 0
+    for platform in (None, "miniprogram", "web"):
+        headers = _token_headers(token)
+        if platform:
+            headers["X-Client-Platform"] = platform
+        status, obj, resp_headers = _http_json("GET", CHAT_BASE + PATH_LIST_TASKS,
+                                                headers, timeout=10)
+        last_status = status
+        if status == 200 and isinstance(obj, dict) and obj.get("code") in (0, "0", None):
+            uid = uid or resp_headers.get("x-user-id") or resp_headers.get("X-User-Id") or ""
+            return True, uid, "HTTP %s" % status
+    return False, uid, "HTTP %s" % last_status
+
+
+def validate_cookies(cookies):
+    """验证 Web 登录 Cookie 是否能正常读取成长任务，返回 (ok, uid, detail)。"""
+    status, obj, headers = _http_json("GET", WEB_BASE + PATH_LIST_TASKS,
+                                      _cookie_headers(cookies), timeout=10)
+    ok = status == 200 and isinstance(obj, dict) and obj.get("code") in (0, "0", None)
+    uid = headers.get("x-user-id") or headers.get("X-User-Id") or ""
+    return ok, uid, "HTTP %s" % status
+
+
+def _plugin_token_from_cookies(cookies, state):
+    """用 Web 登录会话尝试换取桌面端 Bearer Token（失败返回空串）。
+
+    state 完成后 token 接口本身不需要 Cookie；先不带 Cookie 请求，
+    避免旧/无效 Cookie 干扰，失败再带上 Cookie 重试。
+    """
+    if not state:
+        return ""
+    url = WEB_BASE + "/v2/plugin/auth/token?state=" + urllib.parse.quote(str(state))
+    bare = {
+        "Accept": "application/json",
+        "X-No-Authorization": "true",
+        "User-Agent": CLIENT_UA,
+    }
+    with_cookie = _cookie_headers(cookies or [])
+    with_cookie["X-No-Authorization"] = "true"
+    for headers in (bare, with_cookie):
+        status, obj, _ = _http_json("GET", url, headers, timeout=10)
+        if status != 200 or not isinstance(obj, dict):
+            continue
+        data = obj.get("data") if isinstance(obj.get("data"), dict) else obj
+        for key in ("access_token", "accessToken", "token"):
+            token = data.get(key) or obj.get(key)
+            if isinstance(token, str) and token.count(".") == 2 and len(token) > 50:
+                return token
+    return ""
+
+
+def _exchange_token_from_cookies(cookies):
+    """用已登录的 Web 会话走 plugin auth state 流程，换取桌面端 Bearer Token。
+
+    流程：
+      1. POST /v2/plugin/auth/state?platform=workbuddy  -> state
+      2. GET  /console/auth/login?...&state=...          -> 完成该 state
+      3. GET  /v2/plugin/auth/token?state=...            -> accessToken
+    返回 (token, uid)；失败返回 ("", "")。
+    """
+    if not cookies:
+        return "", ""
+    headers = _cookie_headers(cookies)
+    headers["Content-Type"] = "application/json"
+    headers["X-No-Authorization"] = "true"
+    headers["X-Domain"] = "www.workbuddy.cn"
+    status, obj, _ = _http_json(
+        "POST", WEB_BASE + "/v2/plugin/auth/state?platform=workbuddy",
+        headers, payload={}, timeout=10)
+    if status != 200 or not isinstance(obj, dict):
+        return "", ""
+    data = obj.get("data") if isinstance(obj.get("data"), dict) else obj
+    state = data.get("state") or obj.get("state") or ""
+    if not state:
+        return "", ""
+    login_url = (WEB_BASE + "/console/auth/login?platform=workbuddy&state="
+                 + urllib.parse.quote(str(state)) + "&domain=www.workbuddy.cn")
+    _http_json("GET", login_url, headers, timeout=10)
+    token = _plugin_token_from_cookies(cookies, state)
+    if not token:
+        return "", ""
+    ok, uid, _ = validate_token(token)
+    if not ok:
+        return "", ""
+    return token, uid
+
+
+def _dpapi(data, protect):
+    """Windows DPAPI 加/解密；非 Windows 或失败返回 None。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD),
+                        ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+        crypt32 = ctypes.windll.crypt32
+        kernel32 = ctypes.windll.kernel32
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+
+        buf = ctypes.create_string_buffer(data, len(data))
+        blob_in = DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        blob_out = DATA_BLOB()
+        if protect:
+            crypt32.CryptProtectData.argtypes = [
+                ctypes.POINTER(DATA_BLOB), wintypes.LPCWSTR,
+                ctypes.POINTER(DATA_BLOB), ctypes.c_void_p,
+                ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(DATA_BLOB)]
+            crypt32.CryptProtectData.restype = wintypes.BOOL
+            ok = crypt32.CryptProtectData(
+                ctypes.byref(blob_in), None, None, None, None, 0x1,
+                ctypes.byref(blob_out))
+        else:
+            crypt32.CryptUnprotectData.argtypes = [
+                ctypes.POINTER(DATA_BLOB), ctypes.POINTER(wintypes.LPWSTR),
+                ctypes.POINTER(DATA_BLOB), ctypes.c_void_p,
+                ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(DATA_BLOB)]
+            crypt32.CryptUnprotectData.restype = wintypes.BOOL
+            ok = crypt32.CryptUnprotectData(
+                ctypes.byref(blob_in), None, None, None, None, 0x1,
+                ctypes.byref(blob_out))
+        if not ok:
+            return None
+        try:
+            return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+        finally:
+            kernel32.LocalFree(blob_out.pbData)
+    except Exception:
+        return None
+
+
+def save_auth_cache(data):
+    """保存登录缓存；Windows 用 DPAPI 加密，其他平台以 0600 权限落盘。"""
+    os.makedirs(AUTH_CACHE_DIR, exist_ok=True)
+    raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    if sys.platform == "win32":
+        enc = _dpapi(raw, protect=True)
+        if enc:
+            blob = b"WBD1\n" + enc
+        else:
+            log("警告: DPAPI 加密失败，登录缓存将以明文保存")
+            blob = b"WBP1\n" + raw
+    else:
+        blob = b"WBP1\n" + raw
+    tmp = AUTH_CACHE_FILE + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(blob)
+    try:
+        os.chmod(tmp, 0o600)
+    except Exception:
+        pass
+    os.replace(tmp, AUTH_CACHE_FILE)
+    return AUTH_CACHE_FILE
+
+
+def load_auth_cache():
+    if not os.path.exists(AUTH_CACHE_FILE):
+        return None
+    try:
+        with open(AUTH_CACHE_FILE, "rb") as f:
+            blob = f.read()
+        if blob.startswith(b"WBD1\n"):
+            raw = _dpapi(blob[5:], protect=False)
+            if raw is None:
+                return None
+        elif blob.startswith(b"WBP1\n"):
+            raw = blob[5:]
+        else:
+            return None
+        data = json.loads(raw.decode("utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def clear_auth_cache():
+    try:
+        if os.path.exists(AUTH_CACHE_FILE):
+            os.remove(AUTH_CACHE_FILE)
+        return True
+    except Exception:
+        return False
+
+
+# ---- 浏览器 CDP 最小客户端（零第三方依赖） ----
+
+class _WebSocket:
+    """只实现 CDP 需要的 WebSocket 文本帧收发。"""
+
+    def __init__(self, ws_url, timeout=10):
+        parsed = urllib.parse.urlparse(ws_url)
+        self.sock = socket.create_connection((parsed.hostname, parsed.port), timeout=timeout)
+        self.sock.settimeout(10)
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        path = parsed.path + (("?" + parsed.query) if parsed.query else "")
+        req = ("GET %s HTTP/1.1\r\nHost: %s:%s\r\n"
+               "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+               "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n"
+               % (path, parsed.hostname, parsed.port, key))
+        self.sock.sendall(req.encode("ascii"))
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("WebSocket 握手连接被关闭")
+            buf += chunk
+        head, self.buf = buf.split(b"\r\n\r\n", 1)
+        if b" 101 " not in head.split(b"\r\n")[0]:
+            raise ConnectionError("WebSocket 握手失败: %s"
+                                  % head.split(b"\r\n")[0].decode("latin1"))
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("WebSocket 连接已关闭")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def send(self, obj):
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        header = bytearray([0x81])
+        n = len(data)
+        if n < 126:
+            header.append(0x80 | n)
+        elif n < 65536:
+            header.append(0x80 | 126)
+            header += struct.pack(">H", n)
+        else:
+            header.append(0x80 | 127)
+            header += struct.pack(">Q", n)
+        mask = os.urandom(4)
+        header += mask
+        self.sock.sendall(bytes(header) + bytes(
+            b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def recv(self):
+        chunks = []
+        while True:
+            b1, b2 = self._read(2)
+            fin, opcode = b1 & 0x80, b1 & 0x0f
+            masked, length = b2 & 0x80, b2 & 0x7f
+            if length == 126:
+                length = struct.unpack(">H", self._read(2))[0]
+            elif length == 127:
+                length = struct.unpack(">Q", self._read(8))[0]
+            mask = self._read(4) if masked else None
+            payload = self._read(length)
+            if mask:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            if opcode == 8:
+                raise ConnectionError("WebSocket 收到关闭帧")
+            if opcode == 9:
+                header = bytearray([0x8A, 0x80 | len(payload)])
+                pong_mask = os.urandom(4)
+                header += pong_mask
+                self.sock.sendall(bytes(header) + bytes(
+                    b ^ pong_mask[i % 4] for i, b in enumerate(payload)))
+                continue
+            if opcode == 10:
+                continue
+            chunks.append(payload)
+            if fin:
+                return b"".join(chunks)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+class _CDP:
+    def __init__(self, ws_url):
+        self.ws = _WebSocket(ws_url)
+        self.next_id = 0
+
+    def call(self, method, params=None, timeout=20):
+        self.next_id += 1
+        mid = self.next_id
+        self.ws.send({"id": mid, "method": method, "params": params or {}})
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                msg = json.loads(self.ws.recv().decode("utf-8"))
+            except socket.timeout:
+                continue
+            if msg.get("id") == mid:
+                if "error" in msg:
+                    raise UpstreamError("CDP %s 失败: %s" % (method, msg["error"]))
+                return msg.get("result") or {}
+        raise UpstreamError("CDP %s 超时" % method)
+
+    def close(self):
+        self.ws.close()
+
+
+def _find_browser(preferred=None):
+    if preferred:
+        if os.path.exists(preferred):
+            return preferred
+        name = preferred.lower()
+        candidates = {
+            "chrome": [
+                os.path.join(os.environ.get("ProgramFiles", ""), "Google", "Chrome", "Application", "chrome.exe"),
+                os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Google", "Chrome", "Application", "chrome.exe"),
+                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
+            ],
+            "edge": [
+                os.path.join(os.environ.get("ProgramFiles", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+                os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+            ],
+        }.get(name, [])
+        for p in candidates:
+            if p and os.path.exists(p):
+                return p
+    for p in (
+        os.path.join(os.environ.get("ProgramFiles", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(os.environ.get("ProgramFiles", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    ):
+        if p and os.path.exists(p):
+            return p
+    for name in ("google-chrome", "chromium", "chromium-browser",
+                 "microsoft-edge", "microsoft-edge-stable"):
+        p = shutil.which(name)
+        if p:
+            return p
+    raise UpstreamError("未找到 Chrome/Edge，请用 --browser 指定浏览器路径，或使用 --manual 手动粘贴 Token")
+
+
+def _wait_devtools_port(profile, timeout=20):
+    path = os.path.join(profile, "DevToolsActivePort")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+                if lines:
+                    return int(lines[0])
+            except Exception:
+                pass
+        time.sleep(0.1)
+    raise UpstreamError("浏览器调试端口启动超时")
+
+
+def _page_targets(port):
+    """列出当前浏览器里可调试的页面目标。"""
+    try:
+        status, targets, _ = _http_json(
+            "GET", "http://127.0.0.1:%d/json/list" % port, {}, timeout=3)
+    except Exception:
+        return []
+    if status != 200 or not isinstance(targets, list):
+        return []
+    return [t for t in targets
+            if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
+
+
+def _wait_page_target(port, timeout=20):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        pages = _page_targets(port)
+        if pages:
+            for t in pages:
+                if "workbuddy.cn" in (t.get("url") or ""):
+                    return t
+            return pages[0]
+        time.sleep(0.2)
+    raise UpstreamError("未找到浏览器页面调试目标")
+
+
+def _kill_process_tree(proc):
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(3)
+            except Exception:
+                proc.kill()
+    except Exception:
+        pass
+    if sys.platform == "win32" and proc.poll() is None:
+        try:
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=10)
+        except Exception:
+            pass
+
+
+JS_COLLECT_AUTH = r"""
+(() => {
+  const out = {url: location.href, title: document.title, loggedIn: false, jwts: [], keys: []};
+  const jwtRe = /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/;
+  const body = (document.body && document.body.innerText) || "";
+  out.loggedIn = (location.pathname.indexOf("growth-center") >= 0 &&
+                  /个人版|成长计划|成长中心/.test(body));
+  const add = (source, value) => {
+    if (typeof value === "string" && value.length >= 20 && value.length < 8192) {
+      out.jwts.push({source: source, token: value});
+    }
+  };
+  const scan = (store, name) => {
+    try {
+      for (let i = 0; i < store.length && out.keys.length < 120; i++) {
+        const k = store.key(i);
+        const v = store.getItem(k) || "";
+        out.keys.push(name + ":" + k);
+        const m = v.match(jwtRe);
+        if (m) add(name + ":" + k, m[0]);
+        else if (/token|auth/i.test(k)) {
+          add(name + ":" + k, v);
+          try {
+            const obj = JSON.parse(v);
+            const tv = obj && (obj.token || obj.accessToken || obj.access_token);
+            if (tv) add(name + ":" + k + ".token", tv);
+          } catch (e) {}
+        }
+      }
+    } catch (e) {}
+  };
+  scan(localStorage, "local");
+  scan(sessionStorage, "session");
+  try { add("session:growth-center-token", sessionStorage.getItem("growth-center-token")); } catch (e) {}
+  const um = location.href.match(/[?&]token=([^&]+)/);
+  if (um) add("url", decodeURIComponent(um[1]));
+  return out;
+})()
+"""
+
+
+JS_PLUGIN_STATE = r"""
+(async () => {
+  const out = {ok: false};
+  try {
+    const s = await fetch('/v2/plugin/auth/state?platform=workbuddy', {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'X-No-Authorization': 'true'
+      },
+      body: '{}'
+    });
+    out.stateStatus = s.status;
+    const sj = await s.json().catch(() => ({}));
+    const state = sj && sj.data && sj.data.state;
+    if (!state) {
+      out.error = 'no_state';
+      out.body = JSON.stringify(sj).slice(0, 500);
+      return out;
+    }
+    out.state = state;
+    const l = await fetch('/console/auth/login?platform=workbuddy&state=' +
+      encodeURIComponent(state) + '&domain=www.workbuddy.cn', {
+      credentials: 'include',
+      headers: {'Accept': 'application/json', 'X-Domain': 'www.workbuddy.cn'}
+    });
+    out.loginStatus = l.status;
+    out.loginUrl = l.url;
+    out.ok = true;
+    return out;
+  } catch (e) {
+    out.error = String(e);
+    return out;
+  }
+})()
+"""
+
+
+def _collect_page_state(cdp):
+    result = cdp.call("Runtime.evaluate", {
+        "expression": JS_COLLECT_AUTH,
+        "returnByValue": True,
+        "awaitPromise": True,
+    })
+    if result.get("exceptionDetails"):
+        return {}
+    return (result.get("result") or {}).get("value") or {}
+
+
+def _plugin_state_from_page(cdp):
+    """在浏览器页面内完成 plugin auth state 流程，返回 {state, ...}。"""
+    try:
+        result = cdp.call("Runtime.evaluate", {
+            "expression": JS_PLUGIN_STATE,
+            "returnByValue": True,
+            "awaitPromise": True,
+        })
+    except Exception:
+        return {}
+    if result.get("exceptionDetails"):
+        return {}
+    value = (result.get("result") or {}).get("value") or {}
+    return value if isinstance(value, dict) else {}
+
+
+def _poll_plugin_token(state, timeout=30):
+    """轮询 plugin token 接口；state 完成后该接口不需要 Cookie。"""
+    if not state:
+        return "", ""
+    url = WEB_BASE + "/v2/plugin/auth/token?state=" + urllib.parse.quote(str(state))
+    headers = {
+        "Accept": "application/json",
+        "X-No-Authorization": "true",
+        "User-Agent": CLIENT_UA,
+    }
+    deadline = time.time() + max(3, int(timeout))
+    last = ""
+    while time.time() < deadline:
+        status, obj, _ = _http_json("GET", url, headers, timeout=10)
+        if status == 200 and isinstance(obj, dict):
+            data = obj.get("data") if isinstance(obj.get("data"), dict) else obj
+            for key in ("accessToken", "access_token", "token"):
+                token = data.get(key) or obj.get(key)
+                if (isinstance(token, str) and token.count(".") == 2
+                        and len(token) > 50):
+                    ok, uid, detail = validate_token(token)
+                    if ok:
+                        return token, uid
+                    last = detail
+        time.sleep(1)
+    if last:
+        log("[login] Token 校验未通过（%s）" % last)
+    return "", ""
+
+
+def _collect_cookies(cdp):
+    result = cdp.call("Network.getAllCookies")
+    return _filter_auth_cookies(result.get("cookies") or [])
+
+
+def _save_browser_auth(token, cookies, uid):
+    data = {
+        "version": 1,
+        "source": "browser" if token and cookies else ("browser-token" if token else "browser-cookie"),
+        "capturedAt": now_ms(),
+        "accessToken": token or "",
+        "uid": uid or jwt_uid(token) or "",
+        "domain": "www.workbuddy.cn",
+        "cookies": cookies or [],
+        "expiresAt": jwt_expiry_ms(token) if token else _cookie_expiry_ms(cookies),
+    }
+    return save_auth_cache(data)
+
+
+def _manual_login():
+    print()
+    print("请在已登录 WorkBuddy 网页的浏览器中打开：")
+    print("  " + GROWTH_CENTER_URL)
+    print("按 F12 → Network → 任意 growth 请求 → 复制请求头里的")
+    print("  Authorization: Bearer eyJ...")
+    print()
+    try:
+        token = getpass.getpass("粘贴 Token（输入不回显）: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        log("已取消")
+        return 1
+    if token.lower().startswith("authorization:"):
+        token = token.split(":", 1)[1].strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    if not token:
+        log("未输入 Token")
+        return 1
+    ok, uid, detail = validate_token(token)
+    if not ok:
+        log("Token 验证失败（%s），请确认复制的是 Bearer Token 且未过期" % detail)
+        return 1
+    path = _save_browser_auth(token, [], uid)
+    log("✓ Token 已验证并保存到登录缓存：%s" % path)
+    log("  UID: %s" % (uid or "未知"))
+    log("  到期: %s（剩余 %s）" % (format_ts(jwt_expiry_ms(token)),
+                                  remaining_text(jwt_expiry_ms(token))))
+    return 0
+
+
+def browser_login(preferred=None, timeout=300, manual=False):
+    """弹窗打开浏览器，等待用户登录，自动抓取 Token / Web Cookie 并缓存。"""
+    if manual:
+        return _manual_login()
+
+    log("正在启动浏览器登录窗口...")
+    proc = None
+    profile = None
+    cdp = None
+    try:
+        browser = _find_browser(preferred)
+        profile = tempfile.mkdtemp(prefix="workbuddy-login-")
+        args = [
+            browser,
+            "--remote-debugging-port=0",
+            "--remote-allow-origins=*",
+            "--user-data-dir=" + profile,
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-sync",
+            GROWTH_CENTER_URL,
+        ]
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        port = _wait_devtools_port(profile)
+        target = _wait_page_target(port)
+        cdp = _CDP(target["webSocketDebuggerUrl"])
+        cdp.call("Runtime.enable")
+        cdp.call("Network.enable")
+        log("浏览器已打开，请在弹窗中完成登录（扫码或账号登录均可）...")
+        log("登录成功后会自动关闭窗口，无需手动操作。")
+
+        deadline = time.time() + max(10, int(timeout))
+        token = ""
+        cookies = []
+        uid = ""
+        last_state = {}
+        last_cookie_check = 0.0
+        last_log = 0.0
+        last_urls = []
+        cookie_names = []
+        last_cookie_names = []
+        current_id = target.get("id") or ""
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                log("[login] 浏览器已关闭，停止等待")
+                break
+            pages = _page_targets(port)
+            urls = [p.get("url") or "" for p in pages]
+            if urls:
+                last_urls = urls
+
+            # 登录可能在新标签页完成；优先切到成长中心页面。
+            growth = next((p for p in pages
+                           if "/profile/growth-center" in (p.get("url") or "")), None)
+            if growth and growth.get("id") != current_id:
+                try:
+                    new_cdp = _CDP(growth["webSocketDebuggerUrl"])
+                    new_cdp.call("Runtime.enable")
+                    new_cdp.call("Network.enable")
+                    if cdp is not None:
+                        cdp.close()
+                    cdp = new_cdp
+                    current_id = growth.get("id") or ""
+                    log("[login] 已切换到成长中心页面")
+                except Exception as e:
+                    log("[login] 切换页面失败: %s" % e)
+
+            state = {}
+            try:
+                state = _collect_page_state(cdp)
+            except Exception:
+                state = {}
+            if state:
+                last_state = state
+
+            if time.time() - last_log >= 5:
+                last_log = time.time()
+                log("[login] 页面: %s" % (" | ".join(urls[:4]) or "未知"))
+                if state:
+                    log("[login] 登录标记: %s | Token候选: %d"
+                        % ("是" if state.get("loggedIn") else "否",
+                           len(state.get("jwts") or [])))
+
+            for item in (state.get("jwts") or [])[:5]:
+                if time.time() >= deadline:
+                    break
+                candidate = (item.get("token") or "").strip()
+                if len(candidate) < 20 or candidate.startswith(("{", "[")):
+                    continue
+                if any(ch.isspace() for ch in candidate):
+                    continue
+                ok, token_uid, _ = validate_token(candidate)
+                if ok:
+                    token = candidate
+                    uid = token_uid or uid
+                    break
+            if token:
+                try:
+                    cookies = _collect_cookies(cdp)
+                except Exception:
+                    cookies = []
+                break
+
+            if state.get("loggedIn") or time.time() - last_cookie_check > 5:
+                last_cookie_check = time.time()
+                try:
+                    got = _collect_cookies(cdp)
+                except Exception:
+                    got = []
+                if got:
+                    cookie_names = sorted({c.get("name") for c in got
+                                           if c.get("name")})
+                    if cookie_names != last_cookie_names:
+                        last_cookie_names = cookie_names
+                        log("[login] Cookie: %s" % ", ".join(cookie_names))
+                    ok, cookie_uid, _ = validate_cookies(got)
+                    page_url = state.get("url") or ""
+                    if (ok or state.get("loggedIn")
+                            or "/profile/growth-center" in page_url):
+                        # 优先在页面上下文里完成 plugin auth state 流程：
+                        # 浏览器自己携带登录 Cookie，不需要读取 HttpOnly Cookie。
+                        if "www.workbuddy.cn" in page_url:
+                            ps = _plugin_state_from_page(cdp)
+                            if ps.get("error"):
+                                log("[login] plugin state 失败: %s" % ps.get("error"))
+                            if ps.get("state"):
+                                log("[login] 已建立 plugin state，正在换取 Bearer Token...")
+                                wait_left = max(3, int(deadline - time.time()))
+                                plugin_token, plugin_uid = _poll_plugin_token(
+                                    ps["state"], timeout=min(20, wait_left))
+                                if plugin_token:
+                                    token = plugin_token
+                                    cookies = got
+                                    uid = plugin_uid or cookie_uid or uid
+                                    log("[login] 已通过浏览器会话换取到 Bearer Token")
+                                    break
+                        # 回退：Python 侧用 Cookie 走同一套接口。
+                        plugin_token, plugin_uid = _exchange_token_from_cookies(got)
+                        if plugin_token:
+                            token = plugin_token
+                            cookies = got
+                            uid = plugin_uid or cookie_uid or uid
+                            log("[login] 已从 Web 会话换取到 Bearer Token")
+                            break
+                        if ok:
+                            cookies = got
+                            uid = cookie_uid or uid
+                            break
+
+                    # 有些 Web 登录只下发 SSO Cookie；尝试用 plugin 接口
+                    # 换取桌面端 Bearer Token。
+                    states = []
+                    match = re.search(r"[?&]state=([^&]+)", state.get("url") or "")
+                    if match:
+                        states.append(urllib.parse.unquote(match.group(1)))
+                    states.append("0")
+                    for st in dict.fromkeys(states):
+                        plugin_token = _plugin_token_from_cookies(got, st)
+                        if not plugin_token:
+                            continue
+                        tok_ok, tok_uid, _ = validate_token(plugin_token)
+                        if tok_ok:
+                            token = plugin_token
+                            uid = tok_uid or uid
+                            cookies = got
+                            log("[login] 已用 Web 会话换取到 Bearer Token")
+                            break
+                    if token:
+                        break
+
+            time.sleep(2)
+
+        if not token and not cookies:
+            log("登录等待超时（%d 秒），未获取到有效 Token 或 Cookie。" % timeout)
+            if last_urls:
+                log("最后页面: %s" % " | ".join(last_urls[:4]))
+            if last_state:
+                log("当前页面: %s" % (last_state.get("url") or ""))
+                keys = last_state.get("keys") or []
+                if keys:
+                    log("页面存储键（前 20 个）: %s" % ", ".join(keys[:20]))
+            if cookie_names:
+                log("已拿到 Cookie 但无法读取成长任务: %s" % ", ".join(cookie_names))
+                log("这些可能只是 SSO Cookie，业务会话还没有建立。")
+            log("可重试，或运行：python workbuddy_task.py login --manual")
+            return 1
+
+        path = _save_browser_auth(token, cookies, uid)
+        log("✓ 浏览器登录成功，凭据已写入登录缓存")
+        log("  UID: %s" % (uid or "未知"))
+        if token:
+            exp = jwt_expiry_ms(token)
+            log("  Token: 已获取（到期 %s，剩余 %s）"
+                % (format_ts(exp), remaining_text(exp)))
+        if cookies:
+            exp = _cookie_expiry_ms(cookies)
+            log("  Cookie: %d 个（最早到期 %s，剩余 %s）"
+                % (len(cookies), format_ts(exp), remaining_text(exp)))
+        if not token:
+            log("⚠ 未换取到 Bearer Token，当前为 Web Cookie 模式：")
+            log("  只能查看/报名/领奖；对话类任务需要 Token，可运行 login --manual 粘贴。")
+        log("  缓存文件: %s" % path)
+        return 0
+    except UpstreamError as e:
+        log("浏览器登录失败: %s" % e)
+        return 1
+    except Exception as e:
+        log("浏览器登录失败: %s" % e)
+        return 1
+    finally:
+        if cdp is not None:
+            cdp.close()
+        _kill_process_tree(proc)
+        if profile:
+            shutil.rmtree(profile, ignore_errors=True)
+
+
+def cmd_status():
+    cache = load_auth_cache()
+    print("登录缓存: %s" % AUTH_CACHE_FILE)
+    if not cache:
+        log("未找到浏览器登录缓存。请运行：python workbuddy_task.py login")
+        return 1
+    log("来源: %s" % (cache.get("source") or "未知"))
+    log("UID: %s" % (cache.get("uid") or "未知"))
+    token = cache.get("accessToken") or ""
+    cookies = cache.get("cookies") if isinstance(cache.get("cookies"), list) else []
+    valid = False
+    if token:
+        exp = jwt_expiry_ms(token) or int(cache.get("expiresAt") or 0)
+        left = remaining_text(exp)
+        log("Token: %s（到期 %s，剩余 %s）"
+            % ("已过期" if left == "已过期" else "有效", format_ts(exp), left))
+        if left != "已过期" and exp - now_ms() < 7 * 86400000:
+            log("⚠ Token 将在 %s 后过期，建议运行：python workbuddy_task.py login" % left)
+        valid = valid or left != "已过期"
+    if cookies:
+        exp = _cookie_expiry_ms(cookies)
+        left = remaining_text(exp)
+        log("Cookie: %d 个（最早到期 %s，剩余 %s）"
+            % (len(cookies), format_ts(exp), left))
+        if left != "已过期" and exp - now_ms() < 3 * 86400000:
+            log("⚠ Cookie 将在 %s 后过期，建议运行：python workbuddy_task.py login" % left)
+        valid = valid or left != "已过期"
+    if not valid:
+        log("缓存中没有可用凭据，请重新运行 login")
+        return 1
+    return 0
+
+
+def cmd_logout():
+    if clear_auth_cache():
+        log("已删除登录缓存：%s" % AUTH_CACHE_FILE)
+        return 0
+    log("删除登录缓存失败：%s" % AUTH_CACHE_FILE)
+    return 1
+
+
+def warn_auth_expiry(client):
+    exp = client.auth_expires_at()
+    if not exp:
+        return
+    left = remaining_text(exp)
+    if left == "已过期":
+        log("⚠ 登录凭据已过期，请运行：python workbuddy_task.py login")
+    elif exp - now_ms() < (7 if client.token else 3) * 86400000:
+        log("⚠ 登录凭据将在 %s 后过期，建议运行：python workbuddy_task.py login" % left)
+
+
 # ---------------------------------------------------------------------------
 # 上游错误
 # ---------------------------------------------------------------------------
@@ -192,19 +1334,40 @@ class WorkBuddyClient:
         auth = session.get("auth") or {}
         account = session.get("account") or {}
         self.token = auth.get("accessToken")
+        raw_cookies = session.get("cookies") or []
+        self.cookies = raw_cookies if isinstance(raw_cookies, list) else []
+        self.expires_at = int(session.get("expiresAt") or 0)
         self.uid = account.get("uid")
-        self.nickname = account.get("nickname") or ""
+        raw_nick = account.get("nickname")
+        self.nickname = raw_nick if isinstance(raw_nick, str) else ""
         self.enterprise_id = account.get("enterpriseId") or ""
-        self.domain = auth.get("domain") or ""
-        if not self.token or not self.uid:
+        self.domain = auth.get("domain") or "www.workbuddy.cn"
+        if isinstance(self.token, dict):
+            raise ValueError("ENCRYPTED_SESSION: 本地凭据为加密格式 ($wbEncrypted)，且未成功解密")
+        if not self.token:
+            self.token = None
+        if self.token and not self.uid:
+            self.uid = jwt_uid(self.token)
+        if self.token and not self.uid:
+            raise ValueError("NO_SESSION: Token 缺少 UID，请同时设置 WORKBUDDY_UID")
+        if not self.token and not self.cookies:
             raise ValueError("NO_SESSION: 本地未找到有效登录会话")
         # realm：domain 后缀 .workbuddy.ai → global（本脚本只处理 CN 成长任务体系）
         self.is_global = self.domain.lower().endswith("workbuddy.ai")
+
+    def auth_expires_at(self):
+        if self.token:
+            return jwt_expiry_ms(self.token) or self.expires_at
+        return _cookie_expiry_ms(self.cookies)
 
     # ---- 头部 ----
 
     def billing_headers(self, mp=False):
         """growth 域 / billing 域请求头（对齐 Go BillingHeaders）。"""
+        if not self.token:
+            raise UpstreamError(
+                "AUTH_REQUIRED: 该操作需要桌面端 Token；浏览器 Cookie 模式仅支持"
+                "任务列表/报名/领奖。请运行 python workbuddy_task.py login 获取完整凭据。")
         h = {
             "Authorization": "Bearer " + self.token,
             "Accept": "application/json",
@@ -228,16 +1391,21 @@ class WorkBuddyClient:
         return h
 
     def claim_headers(self):
-        """Web 成长中心领奖请求头（对齐 Go ClaimReward 的浏览器形态）。"""
+        """Web 成长中心请求头（Bearer 或浏览器 Cookie 两种形态）。"""
         h = {
-            "Authorization": "Bearer " + self.token,
             "Accept": "application/json, text/plain, */*",
             "Content-Type": "application/json",
             "Origin": WEB_BASE,
-            "Referer": WEB_BASE + "/profile/growth-center",
+            "Referer": GROWTH_CENTER_URL,
             "x-client-platform": "web",
             "User-Agent": CLIENT_UA,
         }
+        if self.token:
+            h["Authorization"] = "Bearer " + self.token
+        if self.cookies:
+            h["Cookie"] = _cookie_header(self.cookies)
+        if not self.token and not self.cookies:
+            raise UpstreamError("AUTH_REQUIRED: 没有可用的 Token 或 Web Cookie")
         if self.uid:
             h["X-User-Id"] = self.uid
         if self.enterprise_id:
@@ -245,6 +1413,12 @@ class WorkBuddyClient:
             h["X-Tenant-Id"] = self.enterprise_id
         if self.domain:
             h["X-Domain"] = self.domain
+        return h
+
+    def web_headers(self):
+        """Web 成长中心列表/报名请求头（Cookie 模式）。"""
+        h = self.claim_headers()
+        h["Accept"] = "application/json, text/plain, */*"
         return h
 
     # ---- 底层请求 ----
@@ -289,14 +1463,26 @@ class WorkBuddyClient:
 
     def list_tasks(self, mp=False):
         """GET /v2/activity/growth/tasks 全量任务列表（mp=True 走小程序口径）。"""
-        data = self._envelope("GET", CHAT_BASE + PATH_LIST_TASKS,
-                              self.billing_headers(mp=mp))
+        if mp and not self.token:
+            raise UpstreamError("AUTH_REQUIRED: 小程序任务需要桌面端 Token")
+        if self.token:
+            data = self._envelope("GET", CHAT_BASE + PATH_LIST_TASKS,
+                                  self.billing_headers(mp=mp))
+        else:
+            data = self._envelope("GET", WEB_BASE + PATH_LIST_TASKS,
+                                  self.web_headers())
         return parse_tasks(data)
 
     def accept_tasks(self, codes, mp=False):
         """POST accept 任务（not_accepted → accepted，幂等）。"""
-        self._envelope("POST", CHAT_BASE + PATH_ACCEPT_TASKS,
-                       self.billing_headers(mp=mp), {"task_codes": list(codes)})
+        if mp and not self.token:
+            raise UpstreamError("AUTH_REQUIRED: 小程序任务需要桌面端 Token")
+        if self.token:
+            self._envelope("POST", CHAT_BASE + PATH_ACCEPT_TASKS,
+                           self.billing_headers(mp=mp), {"task_codes": list(codes)})
+        else:
+            self._envelope("POST", WEB_BASE + PATH_ACCEPT_TASKS_WEB,
+                           self.web_headers(), {"task_codes": list(codes)})
 
     def claim_reward(self, code):
         """Web 成长中心领奖：POST {web}/activity/growth/tasks/{code}/claim。
@@ -395,6 +1581,8 @@ class WorkBuddyClient:
 
     def report_desktop_events(self, events):
         """以桌面客户端指纹批量上报事件（公共指纹注入，业务字段优先）。"""
+        if not self.token:
+            raise UpstreamError("AUTH_REQUIRED: 桌面事件上报需要桌面端 Token")
         if not events:
             raise UpstreamError("desktop report: no events")
         fp = self.desktop_fingerprint()
@@ -448,7 +1636,6 @@ class WorkBuddyClient:
             "userNickname": self.nickname, "enterpriseId": self.enterprise_id,
         }
         headers = {
-            "Authorization": "Bearer " + self.token,
             "Content-Type": "application/json",
             "Accept": "application/json",
             "x-client-platform": "web",
@@ -456,6 +1643,12 @@ class WorkBuddyClient:
             "Referer": page_url,
             "User-Agent": ua,
         }
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
+        if self.cookies:
+            headers["Cookie"] = _cookie_header(self.cookies)
+        if not self.token and not self.cookies:
+            raise UpstreamError("AUTH_REQUIRED: 没有可用的 Token 或 Web Cookie")
         if self.uid:
             headers["X-User-Id"] = self.uid
         self._envelope("POST", WEB_BASE + PATH_REPORT, headers, [ev])
@@ -464,6 +1657,8 @@ class WorkBuddyClient:
 
     def report_mp_events(self, events):
         """以小程序指纹批量上报事件（school_season / Sequential_Tasks 判据）。"""
+        if not self.token:
+            raise UpstreamError("AUTH_REQUIRED: 小程序事件上报需要桌面端 Token")
         if not events:
             raise UpstreamError("mp report: no events")
         base = self.mp_fingerprint()
@@ -538,6 +1733,8 @@ class WorkBuddyClient:
 
     def desktop_chat_with_expert(self, expert_id=""):
         """桌面指纹真实对话，从 SSE 抓服务端 requestId（JOIN 事件必须用真实 id）。"""
+        if not self.token:
+            raise UpstreamError("AUTH_REQUIRED: 真实对话需要桌面端 Token")
         conversation_id = "wb2api-conv-%d" % time.time_ns()
         body = {
             "model": "fast-model",
@@ -1408,7 +2605,7 @@ MP_SUFFIX = " [小程序]"
 
 def accept_pending(c):
     """阶段 0：批量接受尚未接受的任务（默认 + mp 双口径；失败不阻塞）。"""
-    for mp in (False, True):
+    for mp in ((False, True) if c.token else (False,)):
         try:
             tasks = c.list_tasks(mp=mp)
         except UpstreamError as e:
@@ -1506,6 +2703,9 @@ def format_result_line(r):
 
 def run_numbers(c, numbers, do_accept=True):
     """按编号顺序执行（队列语义：先批量 accept，再逐项动作，项间节流）。"""
+    if not c.token:
+        log("提示: 当前为浏览器 Cookie 模式，仅支持任务列表/报名/领奖；"
+            "对话和事件上报类任务需要桌面端 Token。")
     if do_accept:
         log("\n准备执行 %d 项任务，先批量接受未接受的任务..." % len(numbers))
         accept_pending(c)
@@ -1621,17 +2821,150 @@ def summarize(results):
 
 def build_client():
     """加载桌面端会话并构造客户端；失败返回 (None, 报告文本, 退出码)。"""
+    # 1. 优先支持通过环境变量传入明文 Token 和 UID
+    env_token = os.environ.get("WORKBUDDY_TOKEN") or os.environ.get("WORKBUDDY_ACCESS_TOKEN")
+    env_uid = os.environ.get("WORKBUDDY_UID")
+    if env_token:
+        if env_token.lower().startswith("bearer "):
+            env_token = env_token[7:].strip()
+        uid = env_uid or ""
+        domain = os.environ.get("WORKBUDDY_DOMAIN") or "www.workbuddy.cn"
+        auth_file = find_auth_file()
+        if not uid and auth_file and os.path.exists(auth_file):
+            try:
+                s = load_session(auth_file)
+                uid = s.get("account", {}).get("uid") or ""
+                domain = s.get("auth", {}).get("domain") or domain
+            except Exception:
+                pass
+        session = {
+            "auth": {"accessToken": env_token, "domain": domain},
+            "account": {"uid": uid, "nickname": os.environ.get("WORKBUDDY_NICKNAME", "")}
+        }
+        try:
+            client = WorkBuddyClient(session)
+            warn_auth_expiry(client)
+            return client, "", 0
+        except ValueError as e:
+            return None, str(e), 1
+
+    # 2. 浏览器登录缓存：Token 优先；仅 Cookie 时先保留，尝试桌面端 Token
+    cached = load_auth_cache() or {}
+    cached_token = cached.get("accessToken") or ""
+    cached_cookies = cached.get("cookies") if isinstance(cached.get("cookies"), list) else []
+    token_exp = jwt_expiry_ms(cached_token) if cached_token else 0
+    cookie_exp = _cookie_expiry_ms(cached_cookies) if cached_cookies else 0
+    if token_exp and token_exp <= now_ms():
+        cached_token = ""
+    if cookie_exp and cookie_exp <= now_ms():
+        cached_cookies = []
+    pending_cookies = cached_cookies
+
+    if cached_token:
+        cached_uid = cached.get("uid") or jwt_uid(cached_token) or ""
+        session = {
+            "auth": {"accessToken": cached_token,
+                     "domain": cached.get("domain") or "www.workbuddy.cn"},
+            "account": {"uid": cached_uid,
+                        "nickname": cached.get("nickname") or ""},
+            "cookies": pending_cookies,
+            "expiresAt": cached.get("expiresAt") or 0,
+        }
+        try:
+            client = WorkBuddyClient(session)
+            if client.is_global:
+                return None, "global 账号无 CN 成长任务体系，本脚本仅支持 CN 账号", 1
+            log("已加载浏览器登录缓存（%s）" % (cached.get("source") or "browser"))
+            warn_auth_expiry(client)
+            return client, "", 0
+        except ValueError as e:
+            log("登录缓存不可用: %s" % e)
+
+    def build_cookie_client():
+        if not pending_cookies:
+            return None
+        session = {
+            "auth": {"accessToken": None,
+                     "domain": cached.get("domain") or "www.workbuddy.cn"},
+            "account": {"uid": cached.get("uid") or "",
+                        "nickname": cached.get("nickname") or ""},
+            "cookies": pending_cookies,
+            "expiresAt": cached.get("expiresAt") or 0,
+        }
+        try:
+            client = WorkBuddyClient(session)
+            if client.is_global:
+                log("global 账号无 CN 成长任务体系，本脚本仅支持 CN 账号")
+                return None
+            log("已加载浏览器 Web Cookie 登录缓存（仅 Web 成长中心接口可用）")
+            warn_auth_expiry(client)
+            return client, "", 0
+        except ValueError as e:
+            log("登录缓存不可用: %s" % e)
+            return None
+
+    # 3. 探测桌面端凭据文件
     auth_file = find_auth_file()
     if not auth_file or not os.path.exists(auth_file):
+        fallback = build_cookie_client()
+        if fallback:
+            return fallback
         return None, ("未找到 WorkBuddy 登录凭据。请先在本机登录 WorkBuddy 桌面端，"
-                      "或设置环境变量 WORKBUDDY_AUTH_FILE 指向 workbuddy-desktop.info。"), 2
-    session = load_session(auth_file)
+                      "或运行 python workbuddy_task.py login 通过浏览器登录，"
+                      "或设置环境变量 WORKBUDDY_TOKEN 直接设置明文 Token。"), 2
+    try:
+        session = load_session(auth_file)
+    except Exception as e:
+        fallback = build_cookie_client()
+        if fallback:
+            return fallback
+        return None, "读取 WorkBuddy 凭据文件失败: %s" % e, 2
+    if not isinstance(session, dict):
+        fallback = build_cookie_client()
+        if fallback:
+            return fallback
+        return None, "WorkBuddy 凭据文件格式不正确（顶层不是 JSON 对象）", 2
+
+    auth = session.get("auth") or {}
+    raw_token = auth.get("accessToken")
+
+    # 4. 如果是 WorkBuddy 5.6.0+ 的加密信封 ($wbEncrypted)，尝试自动解密
+    if isinstance(raw_token, dict) and raw_token.get("$wbEncrypted"):
+        log("检测到 WorkBuddy 5.6.0+ 本地加密凭据 ($wbEncrypted)，尝试自动解密...")
+        decrypted = try_decrypt_at_rest_token(raw_token)
+        if decrypted:
+            log("✓ 成功从运行中的 WorkBuddy 进程内存中提取密钥，完成本地凭据自动解密！")
+            auth["accessToken"] = decrypted
+        else:
+            fallback = build_cookie_client()
+            if fallback:
+                return fallback
+            account = session.get("account") or {}
+            uid_hint = account.get("uid") or ""
+            return None, (
+                "WorkBuddy 桌面端凭据已加密 ($wbEncrypted)。\n"
+                "自动解密失败（可能原因：未安装 cryptography、WorkBuddy 未运行/无权限，"
+                "或凭据版本不匹配）。\n"
+                "更推荐运行浏览器登录获取凭据：\n"
+                "  python workbuddy_task.py login\n"
+                "也可以直接设置环境变量传入明文 Token：\n"
+                "  $env:WORKBUDDY_TOKEN = '你的明文Token(以eyJ开头)'"
+                + (("\n  $env:WORKBUDDY_UID   = '%s'" % uid_hint) if uid_hint else "")
+            ), 1
+
+    if pending_cookies:
+        session["cookies"] = pending_cookies
+        session["expiresAt"] = cached.get("expiresAt") or 0
     try:
         client = WorkBuddyClient(session)
     except ValueError as e:
+        fallback = build_cookie_client()
+        if fallback:
+            return fallback
         return None, str(e), 1
     if client.is_global:
         return None, "global 账号无 CN 成长任务体系，本脚本仅支持 CN 账号", 1
+    warn_auth_expiry(client)
     return client, "", 0
 
 
@@ -1653,6 +2986,36 @@ def run_and_report(client, numbers, emit_json=True):
     return 0 if counts["errors"] == 0 else 1
 
 
+def cmd_login(argv):
+    preferred = None
+    timeout = 300
+    manual = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("--browser", "-b") and i + 1 < len(argv):
+            preferred = argv[i + 1]
+            i += 2
+        elif arg == "--timeout" and i + 1 < len(argv):
+            try:
+                timeout = int(argv[i + 1])
+            except ValueError:
+                log("--timeout 需要整数秒")
+                return 2
+            i += 2
+        elif arg in ("--manual", "-m"):
+            manual = True
+            i += 1
+        elif arg in ("-h", "--help"):
+            print("用法: python workbuddy_task.py login [--browser chrome|edge|路径] "
+                  "[--timeout 300] [--manual]")
+            return 0
+        else:
+            log("未知参数: %s" % arg)
+            return 2
+    return browser_login(preferred=preferred, timeout=timeout, manual=manual)
+
+
 def main(argv):
     args = [a for a in argv if a.strip()]
 
@@ -1660,6 +3023,14 @@ def main(argv):
     if args and args[0].lower() in ("list", "menu", "-l"):
         print_menu()
         return 0
+
+    # 浏览器弹窗登录 / 登录状态 / 退出登录
+    if args and args[0].lower() in ("login", "auth"):
+        return cmd_login(args[1:])
+    if args and args[0].lower() in ("status", "whoami"):
+        return cmd_status()
+    if args and args[0].lower() in ("logout", "signout"):
+        return cmd_logout()
 
     client, err, code = build_client()
     if client is None:
