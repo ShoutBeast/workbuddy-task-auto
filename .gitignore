@@ -53,6 +53,8 @@ config.json
 *.pem
 workbuddy-desktop.info
 *workbuddy-*.json
+session.dat
+*.session.dat
 
 # ============================================================
 #  编辑器 / 系统
